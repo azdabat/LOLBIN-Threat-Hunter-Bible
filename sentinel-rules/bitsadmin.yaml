@@ -1,0 +1,50 @@
+id: lolbin-bitsadmin-analytic-rule
+kind: Scheduled
+name: LOLBIN – Suspicious bitsadmin.exe Usage
+description: |
+  Detects suspicious use of bitsadmin.exe using contextual process and command line
+  analysis. This rule is derived from the LOLBIN Threat Hunter Bible rulepack
+  and is intended for production Sentinel deployments with baselined suppression.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  let lookback = 7d;
+  DeviceProcessEvents
+  | where Timestamp >= ago(lookback)
+  | where FileName =~ "bitsadmin.exe"
+  | extend Parent = tostring(InitiatingProcessFileName),
+           Cmd    = tostring(ProcessCommandLine)
+  | where Parent !in ("explorer.exe","svchost.exe","services.exe")
+      or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc")
+  | project Timestamp, DeviceName, DeviceId, AccountName, FileName, Cmd, Parent,
+            ReportId, InitiatingProcessCommandLine
+
+triggerOperator: GreaterThan
+triggerThreshold: 0
+queryFrequency: 1h
+queryPeriod: 1h
+suppressionDuration: 6h
+suppressionEnabled: false
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName
+
+tactics:
+  - execution
+  - defense-evasion
+
+techniques:
+  - T1059
+  - T1218
