@@ -30,36 +30,35 @@ The goal is not to flag every task operation, only the unusual ones.
 // Author: Ala Dabat
 // Table: DeviceProcessEvents
 // ========================================================================
-let lookback = 7d;
+let Lookback = 7d;
 let HighRiskAccounts = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
 
 DeviceProcessEvents
-| where Timestamp >= ago(lookback)
+| where Timestamp >= ago(Lookback)
 | where FileName =~ "schtasks.exe"
-| extend ParentImage = tostring(InitiatingProcessFileName),
-         Cmd = tostring(ProcessCommandLine),
-         ParentCmd = tostring(InitiatingProcessCommandLine),
-         lcmd = tolower(Cmd)
-| where ParentImage !in (AllowedParents)
-   or lcmd has_any ("/create","/change","/run","/tn","/tr") // primary task ops
-   or lcmd has_any (".ps1",".vbs",".js",".hta","-enc","frombase64string")
-   or lcmd has_any ("http://","https://")
-   or lcmd has_any (":\\users\\",":\\programdata\\","\\appdata\\","\\temp\\") // user-writable payloads
-| extend Reason =
+| extend ProcessCommandLineText = tostring(ProcessCommandLine),
+         ParentExecutableName = tostring(InitiatingProcessFileName),
+         ParentProcessCommandLineText = tostring(InitiatingProcessCommandLine),
+         LowercaseProcessCommandLine = tolower(ProcessCommandLineText)
+| where ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe")
+   or LowercaseProcessCommandLine has_any ("/create","/change","/run","/tn","/tr")
+   or LowercaseProcessCommandLine has_any (".ps1",".js",".vbs",".hta","-enc","frombase64string")
+   or LowercaseProcessCommandLine has_any ("http://","https://",":\\users\\","\\appdata\\","\\temp\\",":\\programdata\\")
+| extend DetectionReason =
     case(
-       lcmd has_any ("http://","https://"), "Remote URL staging",
-       lcmd has_any ("-enc","frombase64string"), "Encoded loader",
-       lcmd has_any (".ps1",".vbs",".js",".hta"), "Script-based execution",
-       lcmd has_any ("/create","/change","/run"), "Task manipulation",
-       ParentImage !in (AllowedParents), "Unusual parent",
-       true, "Rare task pattern"
+        LowercaseProcessCommandLine has_any ("http://","https://"),"URL-based execution",
+        LowercaseProcessCommandLine has_any ("-enc","frombase64string"),"Encoded loader",
+        LowercaseProcessCommandLine has_any (".ps1",".js",".vbs",".hta"),"Script task execution",
+        LowercaseProcessCommandLine has_any ("/create","/change","/run"),"Task modification",
+        ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe"),"Unexpected parent",
+        true,"Rare schtasks usage"
     )
-| extend Privileged = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
-          FileName, ProcessCommandLine, InitiatingProcessFileName,
-          InitiatingProcessCommandLine, Reason, ReportId
+| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts),"Yes","No")
+| project Timestamp,DeviceId,DeviceName,AccountName,PrivilegedAccount,
+          FileName,ProcessCommandLineText,ParentExecutableName,
+          ParentProcessCommandLineText,DetectionReason,ReportId
 | order by Timestamp desc
+
 
 ```
 
