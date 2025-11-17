@@ -54,7 +54,7 @@ Use it as:
 ```kql
 // ======================================================================
 // bitsadmin.exe LOLBIN Detection (L3 – Production)
-// Author: Ala Dabat (Alstrum)
+// Author: Ala Dabat
 // Scope: Microsoft Defender for Endpoint (DeviceProcessEvents)
 // Goal: Catch suspicious downloader / persistence / ADS / exfil abuse
 // ======================================================================
