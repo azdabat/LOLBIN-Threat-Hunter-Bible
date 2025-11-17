@@ -53,111 +53,116 @@ Key properties:
 - Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
 - Treats rare parents and encoded / network‑touching commands as primary signal.
 - Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+## 4. Hunter Directives & L3 Pivot Strategy
 
-## // 4. Hunter Directives & L3 Pivot Strategy
-// Use DetectionTier + SuspiciousReason to decide escalation.
-//
-// 4.1 High – Likely Malicious (Immediate Action)
-//
-// Typical Patterns:
-// - mshta http://host/payload.hta → remote HTA loader
-// - mshta https://host/payload.js → script execution
-// - mshta vbscript:Execute("...") → inline fileless execution
-// - mshta launched by Office, browsers, RMM, scheduled tasks, helpdesk tools
-//
-// Actions – Containment:
-// - Isolate device when:
-//   - Remote script execution confirmed
-//   - mshta spawns powershell/cscript
-//   - Obfuscated or encoded payload chains found
-//
-// Process Tree Reconstruction:
-// - Re-run DeviceProcessEvents ±2h
-// - Look for:
-//   - powershell.exe, pwsh.exe
-//   - wscript.exe, cscript.exe
-//   - rundll32.exe, regsvr32.exe
-//   - Archive loaders or encryption tools
-//
-// File Analysis:
-// - Identify HTA/JS/VBS/SCT files
-// - Inspect creation timestamp vs execution
-// - Check writable paths (AppData, Temp, ProgramData)
-//
-// Network & Scope:
-// - Review connections from mshta
-// - Identify domains/IPs/TLD patterns
-// - Check other hosts for same URL/path
-//
-// Impact Assessment:
-// - Determine payload executed
-// - Determine if multiple endpoints hit same host
-// - Assess lateral movement or chained LOLBIN usage
-//
-// 4.2 Medium – Suspicious but Possibly Legitimate
-//
-// Typical Patterns:
-// - Internal HTA files
-// - Local app components using mshta
-// - Rare parent but benign paths
-//
-// Actions:
-// - Validate parent process (admin script vs Office)
-// - Validate domain/URL is internal & expected
-// - Compare with patterns across estate
-// - Review mshta children + follow-up alerts
-// - Recurring & benign → baseline
-// - Unclear → track and escalate if repeated
-//
-// 4.3 Low – Baseline Candidate / Watch-List
-//
-// Typical Patterns:
-// - mshta invoked by internal legacy tools
-// - Non-suspicious local HTA usage
-// - Rare parent but benign context
-//
-// Actions:
-// - Confirm with system/app owners
-// - Recurring benign → baseline
-// - One-off → watch-list
-//
-// 5. Baselining & Suppression (Low Noise)
-//
-// Baseline Legitimate mshta Usage (14–30 days):
-// - Track parent processes
-// - HTA/script paths
-// - Execution frequency
-// - Typical users
-// - Device types
-//
-// Identify Known Good Patterns:
-// - Corporate VPN/profile installers
-// - Internal UI modules executed via HTA
-// - Internal IT admin automation
-//
-// Scoped Allow-Patterns:
-// - Never allow mshta globally.
-// - Use targeted conditions such as:
-//   ParentImage == "corpapp.exe" AND Cmd has "C:\\Program Files\\CorpApp\\ui.hta"
-// - Scope by:
-//   - Device groups
-//   - User roles
-//   - Known internal directories
+Use **DetectionTier** + **SuspiciousReason** to decide escalation.
+
+### 4.1. High – Likely Malicious (Immediate Action)
+
+**Typical Patterns:**
+* `mshta http://host/payload.hta` → remote HTA loader
+* `mshta https://host/payload.js` → script execution
+* `mshta vbscript:Execute("...")` → inline fileless execution
+* `mshta` launched by Office, browsers, RMM, scheduled tasks, helpdesk tools
+
+**Actions – Containment:**
+* **Isolate device** when:
+    * Remote script execution is confirmed.
+    * `mshta` spawns `powershell`/`cscript`.
+    * Obfuscated or encoded payload chains are found.
+
+**Process Tree Reconstruction:**
+* Re-run `DeviceProcessEvents` **±2h**.
+* Look for children:
+    * `powershell.exe`, `pwsh.exe`
+    * `wscript.exe`, `cscript.exe`
+    * `rundll32.exe`, `regsvr32.exe`
+    * Archive loaders or encryption tools
+
+**File Analysis:**
+* Identify HTA/JS/VBS/SCT files.
+* Inspect creation timestamp vs. execution time.
+* Check writable paths (`AppData`, `Temp`, `ProgramData`).
+
+**Network & Scope:**
+* Review connections originating from `mshta`.
+* Identify domains/IPs/TLD patterns.
+* Check other hosts for the same URL/path.
+
+**Impact Assessment:**
+* Determine the payload executed.
+* Determine if multiple endpoints hit the same host.
+* Assess lateral movement or chained LOLBIN usage.
+
+### 4.2. Medium – Suspicious but Possibly Legitimate
+
+**Typical Patterns:**
+* Internal HTA files.
+* Local application components using `mshta`.
+* Rare parent but benign paths.
+
+**Actions:**
+* Validate parent process (admin script vs. Office application).
+* Validate domain/URL is internal and expected.
+* Compare with patterns across the estate.
+* Review `mshta` children and follow-up alerts.
+* Recurring and benign → **baseline**.
+* Unclear → track and escalate if repeated.
+
+### 4.3. Low – Baseline Candidate / Watch-List
+
+**Typical Patterns:**
+* `mshta` invoked by internal legacy tools.
+* Non-suspicious local HTA usage.
+* Rare parent but benign context.
+
+**Actions:**
+* Confirm with system/app owners.
+* Recurring benign → **baseline**.
+* One-off → **watch-list**.
+
+---
+
+## 5. Baselining & Suppression (Low Noise)
+
+### Baseline Legitimate `mshta` Usage (14–30 days):
+* Track parent processes.
+* HTA/script paths.
+* Execution frequency.
+* Typical users.
+* Device types.
+
+**Identify Known Good Patterns:**
+* Corporate VPN/profile installers.
+* Internal UI modules executed via HTA.
+* Internal IT admin automation.
+
+**Scoped Allow-Patterns:**
+* **Never allow `mshta` globally.**
+* Use targeted conditions such as:
+    `ParentImage == "corpapp.exe" AND Cmd has "C:\\Program Files\\CorpApp\\ui.hta"`
+* Scope by:
+    * Device groups
+    * User roles
+    * Known internal directories
+
+---
 
 ## 6. CTI / MISP / OpenCTI Integration
 
 For confirmed malicious instances:
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+* **Extract:**
+    * File hashes of payloads and staging artifacts.
+    * Domains, IPs, URIs observed in network connections.
+* **Push to MISP/OpenCTI as:**
+    * Attributes on existing intrusion sets where appropriate.
+    * New events where this represents a new cluster or campaign.
+* **Tag events with:**
+    * Confidence level,
+    * Kill-chain phase,
+    * Detection source (LOLBIN MDE rule, Sentinel analytic).
 
-This turns a single host‑level detection into durable intelligence.
+This turns a single host-level detection into durable intelligence.
+- Surfaces privileged accounts separately for accelerated triage.
+
