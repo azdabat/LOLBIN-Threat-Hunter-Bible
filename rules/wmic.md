@@ -1,115 +1,124 @@
 # wmic.exe LOLBIN Detection (L2/L3 – Production)
+Author: Ala Dabat
+
+---
 
 ## 1. Threat Overview
+`wmic.exe` provides WMI command-line access. Attackers abuse it to:
+- Execute remote commands (`wmic /node:<host> process call create`)
+- Spawn PowerShell/HTA/script payloads
+- Enumerate system/network info before lateral movement
+- Perform admin share checks, service manipulation, or discovery
 
-wmic.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+This rule flags **abnormal usage**, unusual parents, script/encoded loaders, lateral movement patterns, and remote WMI execution—not legitimate admin tasks.
 
-Abuse patterns for wmic.exe in the last few years include:
+---
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+## 2. MITRE ATT&CK
+- **T1021 – Remote Services (WMI)**
+- **T1077 – Windows Admin Shares**
+- **T1082 – System Information Discovery**
+- **T1016 – Network Configuration Discovery**
 
-Effective detection focuses on **context and behaviour**, not on treating wmic.exe as inherently malicious.
+---
 
-## 2. MITRE ATT&CK Techniques
-
-- T1021 Remote Services
-- T1077 Windows Admin Shares
-- T1082 System Information Discovery
-- T1016 System Network Configuration Discovery
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact Native Rule)
 
 ```kql
+// ========================================================================
+// LOLBIN: wmic.exe – Suspicious Usage (Low Noise)
+// Author: Ala Dabat
+// Table: DeviceProcessEvents
+// ========================================================================
 let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
+let HighRisk = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
 let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "wmic.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
+         Cmd = tostring(ProcessCommandLine),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         lcmd = tolower(Cmd)
+// Suspicious conditions: remote node access, script proxies, encoded payloads, odd parents
 | where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+   or lcmd has "/node:"                          // remote WMI exec
+   or lcmd has_any ("process","call","create")    // often used to spawn payloads
+   or lcmd has_any ("powershell","cmd /c","wscript","mshta","rundll32")
+   or lcmd has_any (".ps1",".js",".vbs",".hta","-enc","frombase64string")
+   or lcmd has_any ("http://","https://")
+| extend Reason =
+    case(
+        lcmd has "/node:",                        "Remote WMI execution",
+        lcmd has_any ("process","call","create"), "WMI process execution",
+        lcmd has_any ("powershell","mshta","wscript","rundll32"), "Proxy execution via wmic",
+        lcmd has_any (".ps1",".js",".vbs",".hta"), "Script payload via WMI",
+        lcmd has_any ("-enc","frombase64string"),  "Encoded loader/command",
+        lcmd has_any ("http://","https://"),       "URL-based remote staging",
+        ParentImage !in (AllowedParents),          "Unexpected parent",
+        true,                                      "Rare wmic usage"
+    )
+| extend Privileged = iif(AccountName in (HighRisk),"Yes","No")
+| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
+          FileName, ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, Reason, ReportId
 | order by Timestamp desc
 ```
+## 4. Hunter Directives & L3 Pivot Strategy
 
-Key properties:
+### 4.1. Process Chain
 
-- Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
-- Treats rare parents and encoded / network‑touching commands as primary signal.
-- Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+Rebuild context around the hit:
+`parent` → **`wmic.exe`** → (payload)
 
-## 4. L3 Pivot Strategy
+**Red flags:**
+* **Parent:** Office application, web browser, mail client, `mshta`, `wscript`.
+* **Child:** `PowerShell`, `cmd`, `rundll32`, script engines (all indicate execution proxy).
+* **Remote Usage:** Remote WMI (`/node:`) calls followed immediately by lateral movement or service changes.
 
-Once a hit is generated:
+### 4.2. File & Staging Activity
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → wmic.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+Pivot to `DeviceFileEvents` **±1h**:
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+* **Staging:** Look for payload writes in `TEMP`/`AppData`/`ProgramData`.
+* **Timing:** Dropped PS1/VBS/JS/EXE shortly **before** a `wmic process call create` execution.
+* **Signer:** Unsigned binaries or scriptlets executed right after staging.
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+### 4.3. Network & Remote Ops
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+Check `DeviceNetworkEvents`:
 
-## 5. Baselining and Suppression
+* **Lateral Movement:** Connections to internal lateral movement targets.
+* **Protocol:** SMB/ADMIN$ usage, WMI RPC traffic (port 135 and dynamic ports).
+* **C2:** New outbound infrastructure detected after WMI execution (indicates payload delivery or C2).
 
-To keep this rule production‑safe:
+### 4.4. Identity, Privilege & Spread
 
-- Capture **all legitimate** wmic.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+* **Prioritize:** Escalate immediately if **`Privileged == Yes`**.
+* **Scope Check:**
+    * Look for multiple `/node:` executions across different hosts.
+    * Check if the same user is performing sequential remote WMI operations.
+    * Look for adjacent alerts involving other lateral movement tools (`psexec`, `wmic`, `sc.exe`, or `winrm`).
 
-## 6. CTI / MISP / OpenCTI Integration
+---
 
-For confirmed malicious instances:
+## 5. Baselining & Suppression
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+* **Observe:** Record legitimate admin automation for 2–4 weeks.
+* **Allow:**
+    * Known good remote inventory scripts.
+    * Vendor monitoring tools using WMI queries.
+* **Warning:** Never broadly allow process creation (`wmic process call create`) via WMI.
 
-This turns a single host‑level detection into durable intelligence.
+### Severity Guidance:
+
+* **High:** Remote WMI execution (`/node:`) or script/encoded payloads.
+* **Medium:** WMI spawning `PowerShell`/`cmd`.
+* **Low:** Simple queries (`wmic os get /value`) with expected parents.
+
+## 6. Operational Notes
+
+This rule has no Threat Intelligence (TI) dependencies.
+
+It catches real-world **lateral movement**, **remote execution**, discovery, and **proxy execution** via WMI, while staying low-noise once baselined for legitimate use.
