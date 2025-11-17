@@ -1,113 +1,120 @@
 # schtasks.exe LOLBIN Detection (L2/L3 – Production)
+Author: Ala Dabat
+
+---
 
 ## 1. Threat Overview
+`schtasks.exe` is a signed scheduler utility. Adversaries use it to persist payloads, run off SMB shares, launch staged EXEs/PS1/VBS/HTA, or to push mid-chain execution under a trusted binary. Detection hinges on context: who launched it, what it launched, and where the payload lives.
 
-schtasks.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+Common abuse patterns:
+- Persistence via `schtasks /create` using user-writable paths (AppData, TEMP, ProgramData)
+- Remote task creation from Office/mailer/browser parents
+- Encoded PowerShell loaders and script proxies
+- Mid-chain lateral staging (`schtasks /run /tn <temp task>`)
 
-Abuse patterns for schtasks.exe in the last few years include:
+The goal is not to flag every task operation, only the unusual ones.
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+---
 
-Effective detection focuses on **context and behaviour**, not on treating schtasks.exe as inherently malicious.
+## 2. MITRE ATT&CK
+- **T1053 – Scheduled Task/Job**
+- **T1547 – Boot/Logon Autostart**
 
-## 2. MITRE ATT&CK Techniques
+---
 
-- T1053 Scheduled Task/Job
-- T1547 Boot or Logon Autostart
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact Native Rule)
 
 ```kql
+// ========================================================================
+// LOLBIN: schtasks.exe – Suspicious Usage (Low Noise)
+// Author: Ala Dabat
+// Table: DeviceProcessEvents
+// ========================================================================
 let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
+let HighRiskAccounts = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
 let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "schtasks.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
+         Cmd = tostring(ProcessCommandLine),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         lcmd = tolower(Cmd)
 | where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+   or lcmd has_any ("/create","/change","/run","/tn","/tr") // primary task ops
+   or lcmd has_any (".ps1",".vbs",".js",".hta","-enc","frombase64string")
+   or lcmd has_any ("http://","https://")
+   or lcmd has_any (":\\users\\",":\\programdata\\","\\appdata\\","\\temp\\") // user-writable payloads
+| extend Reason =
+    case(
+       lcmd has_any ("http://","https://"), "Remote URL staging",
+       lcmd has_any ("-enc","frombase64string"), "Encoded loader",
+       lcmd has_any (".ps1",".vbs",".js",".hta"), "Script-based execution",
+       lcmd has_any ("/create","/change","/run"), "Task manipulation",
+       ParentImage !in (AllowedParents), "Unusual parent",
+       true, "Rare task pattern"
+    )
+| extend Privileged = iif(AccountName in (HighRiskAccounts), "Yes", "No")
+| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
+          FileName, ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, Reason, ReportId
 | order by Timestamp desc
+
 ```
 
-Key properties:
+## 4. Hunter Directives & L3 Pivot Strategy
 
-- Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
-- Treats rare parents and encoded / network‑touching commands as primary signal.
-- Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+### 4.1. Process Chain
 
-## 4. L3 Pivot Strategy
+Rebuild the full process tree around the hit:
+`parent` → **`schtasks.exe`** → `child process`
 
-Once a hit is generated:
+**Red flags:**
+* **Parents:** Office applications, web browsers, mail clients, `wscript.exe`, `mshta.exe` (processes that shouldn't be scheduling tasks).
+* **Children:** `PowerShell`, `CMD`, `curl`/`wget` clones, `dllhost`, archive tools, RDP tooling.
+* **Timing:** Task creation followed by **immediate execution** of an EXE/PS1 from user space (e.g., `%TEMP%` or `%APPDATA%`).
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → schtasks.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+### 4.2. File Activity
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+Pivot to `DeviceFileEvents` **±1h** around the event timestamp:
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+**Look for payload writes in:**
+* `%AppData%`, `%TEMP%`, `%ProgramData%`.
+* **Timing:** EXE/DLL/PS1/VBS/JS created minutes before the scheduled task is set to fire.
+* **Signing:** Compare signed vs. unsigned nature of the final payload.
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+### 4.3. Network Behaviour
 
-## 5. Baselining and Suppression
+Check `DeviceNetworkEvents` **±1h**:
 
-To keep this rule production‑safe:
+* **Activity:** Outbound network connections following the task execution.
+* **Infrastructure:** Bare IPs, odd ports, newly-observed domains.
+* **Correlation:** Look for a direct correlation between the `/tr` (task run) payload and the new network traffic.
 
-- Capture **all legitimate** schtasks.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+### 4.4. Identity & Blast Radius
 
-## 6. CTI / MISP / OpenCTI Integration
+* **User and Role:** Determine the business role of the `AccountName`. If `Privileged == Yes`, escalate immediately.
+* **Look for:**
+    * Multiple task creations by the same user.
+    * Recent risky sign-ins or password resets on that account.
+    * The same task name or payload path across multiple endpoints (indicating wider campaign activity).
 
-For confirmed malicious instances:
+---
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+## 5. Baselining & Suppression
 
-This turns a single host‑level detection into durable intelligence.
+* **Baseline first (2–4 weeks):** Record normal `schtasks.exe` behavior across your environment.
+    * **Typical Baseline:** Software updaters, agent installers, IT management tools.
+* **Tuning:** Allow only **specific known-good command lines** (avoid wildcards).
+* **Re-baseline:** Repeat baselining when tooling or patching cycles change.
+
+### For Production Alerting:
+
+* **High severity:** Encoded loaders, remote URLs, or unsigned payloads running from user paths.
+* **Medium severity:** `/create` or `/change` executed from untrusted parents.
+* **Low severity:** `/run` commands with normal, trusted parents.
+
+## 6. Operational Notes
+
+**Intent:** The primary goal is to catch modern tradecraft where `schtasks` is used as a **persistence launcher**, **mid-chain loader**, or **proxy executor**, while efficiently avoiding noise from routine Windows scheduling. This rule is designed to be standalone, without external CTI or threat-intel dependencies.
