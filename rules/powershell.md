@@ -71,58 +71,182 @@ Key properties:
 - Provides a `SuspiciousReason` column to explain why the row is interesting.
 - Surfaces privileged accounts separately for accelerated triage.
 
+# PowerShell Hunting Rule & L3 Pivot Strategy
+
+This document outlines a high-fidelity hunting rule targeting malicious PowerShell execution and provides a structured Level 3 (L3) pivot strategy for incident validation and scope determination.
+
+## 3. High-Fidelity Detection Properties
+
+This hunting rule is designed to distinguish legitimate automation from suspicious, attacker-controlled command chains.
+
+### Key Properties
+
+* **Contextual Filtering:** Leverages `InitiatingProcessFileName` and `ProcessCommandLine` to separate legitimate automation from suspicious chains.
+
+* **SuspiciousReason Column:** Provides a clear `SuspiciousReason` column explaining the behavioral indicator that flagged each row.
+
+* **Impact Prioritization:** Exposes the `PrivilegedAccount` status so analysts can quickly prioritize impact based on user context.
+
+### Flagged Indicators
+
+The rule flags the presence of several high-risk indicators within the PowerShell command line or execution context:
+
+* **Remote Network Usage:** Indicators such as `Invoke-WebRequest`, `DownloadString`, or external URLs.
+
+* **Obfuscation/Encoding:** Use of `-EncodedCommand`, `FromBase64String`, or other techniques to hide command logic.
+
+* **Script-Loader Patterns:** Execution methods like `IEX`, direct execution of files (`.ps1`, `.js`, `.vbs`, `.hta`).
+
+* **Evasion/Tampering:** Indicators of AMSI or logging tampering.
+
+* **Rare Parent Processes:** PowerShell spawned by unusual parents (e.g., Office applications, web browsers, RMM tools, helpdesk software, or suspicious scheduled tasks).
+
 ## 4. L3 Pivot Strategy
 
-Once a hit is generated:
+Once a hit is generated, the analyst must treat the event as the starting node of a threat graph, not the end of the story.
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → powershell.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+### 4.1. Expand Process Context
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId` (or a `±2h` window). Build the process chain: `parent` → `powershell.exe / pwsh.exe` → `children`.
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+Specifically look for the execution of:
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+* **Offensive Tools / Reconnaissance:** `whoami.exe`, `net.exe`, `netstat.exe`, `nltest.exe`, `dsquery.exe`, `adfind.exe`, `csvde.exe`, `ntdsutil.exe`.
+
+* **Credential Theft / LSASS Access:** `rundll32.exe` abusing `comsvcs.dll`, suspicious `procdump.exe`, `Taskmgr.exe` abuse, or memory dump tools.
+
+* **Lateral Movement Tools:** `wmic.exe`, `psexec.exe`, `schtasks.exe`, `mstsc.exe`, `wmiprvse.exe`.
+
+* **Archive & Staging:** `7z.exe`, `rar.exe`, `tar.exe`, `makecab.exe`.
+
+* **Ransomware / Encryptors:** Unusual encryption utilities or custom binaries spawned shortly after the PowerShell event.
+
+### 4.2. File System Activity
+
+Pivot into `DeviceFileEvents` for the same device (±1 hour window).
+
+**Look for:**
+
+* Newly-written files (`EXE`, `DLL`, `PS1`, `VBS`, `JS`) in high-risk directories: `%TEMP%`, `%APPDATA%`, `%LOCALAPPDATA%`, `ProgramData`, and user profile paths.
+
+* Files created immediately before or after the PowerShell event.
+
+* Scripts matching parts of the PowerShell command line (e.g., file names, URLs, function names).
+
+**Confirm whether:**
+
+* PowerShell wrote a script and then executed it.
+
+* PowerShell dropped known offensive tools (e.g., Mimikatz, Cobalt Strike stagers, custom binaries).
+
+### 4.3. Network Behaviour
+
+Use `DeviceNetworkEvents` for the same device/time window.
+
+**Identify:**
+
+* Remote IPs, FQDNs, and ports used for C2 or staging.
+
+* Cleartext HTTP vs. HTTPS connections.
+
+* First-seen infrastructure or rare domains.
+
+**Correlate:**
+
+* Network patterns with command line strings (domains/paths in the command).
+
+* Whether the same destination is used by other hosts.
+
+* Pivot into separate web/socks logs (if available) to confirm data transfer size and direction.
+
+### 4.4. Identity & Scope
+
+Determine the identity and scope of the compromise.
+
+* **Identity:** Was the account a user vs. a service account? Admin vs. normal user? Interactive vs. scheduled execution?
+
+* **Related Anomalies:** Check for related identity anomalies (e.g., unusual sign-ins, impossible travel, risky sign-ins in Azure AD, MFA fatigue) around the same timeframe.
+
+* **Scope:** Is this a single compromised endpoint? Was the same account used on multiple hosts? Are multiple accounts spawning similar PowerShell chains?
 
 ## 5. Baselining and Suppression
 
-To keep this rule production‑safe:
+PowerShell is heavily used in legitimate administration, making baselining essential to avoid drowning analysts in noise.
 
-- Capture **all legitimate** powershell.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+### Baseline Legitimate Usage (14–30 Days)
+
+Capture all `powershell.exe / pwsh.exe` usage for context:
+
+* Parent images (`ParentImage`).
+
+* Command line patterns (e.g., specific scripts, internal modules).
+
+* Typical times (business hours vs. off-hours).
+
+* System types (servers, workstations, admin jump boxes).
+
+**Summarise by:** ParentImage, command line patterns (normalized), user role/group membership, and device groups.
+
+### Document Known Good Patterns
+
+Typical benign patterns might include:
+
+* Signed internal scripts (`C:\IT\Scripts\Maintenance.ps1`).
+
+* SCCM/Intune/automation tools spawning PowerShell with well-known arguments.
+
+* Monitoring agents using PowerShell for inventory/health checks.
+
+### Create Tight Allow-Patterns
+
+Never wildcard full command lines like `powershell.exe *`. Instead, carve explicit exceptions such as:
+
+* **Specific Parent + Script:** `ParentImage == "ccmexec.exe" AND Cmd has "C:\\Windows\\CCM\\SystemTask.ps1"`
+
+* **Specific Internal Module Path:** `Cmd has "C:\\Company\\Automation\\Run-Backup.ps1"`
+
+Implement suppression either directly in KQL (`where not(...)`) or via detection rule suppression conditions in the security portal.
+
+### Re-Validate Baselines
+
+Always re-validate baselines after any major environmental change (e.g., large software rollouts, migration to new scripting frameworks, modification of admin tooling).
 
 ## 6. CTI / MISP / OpenCTI Integration
 
-For confirmed malicious instances:
+For confirmed malicious PowerShell activity, the detection must be converted into durable intelligence.
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+### Extract Technical IOCs
 
-This turns a single host‑level detection into durable intelligence.
+* **Network:** URLs, domains, and IPs referenced in the command line.
+
+* **Files:** Hashes of downloaded scripts, dropped EXEs/DLLs, archives, or tools.
+
+* **Artifacts:** Distinct script artifacts, function names, unique strings, or C2 patterns.
+
+### Model the Event in Your TI Platform
+
+Create or update events in MISP/OpenCTI:
+
+* Link to an Intrusion Set / Actor (if attribution is reasonable).
+
+* Create Campaign or Incident objects.
+
+* Create Observable objects for URLs, hashes, IPs, file names, and registry keys.
+
+**Tag with:**
+
+* Confidence (e.g., `confidence:high`, `medium`).
+
+* Kill chain phase (execution, persistence, C2, exfiltration).
+
+* Detection source (e.g., `LOLBIN-PowerShell-MDE`, `Sentinel analytic name`).
+
+### Feed Back into Detection
+
+Use exported TI (watchlists, indicators) to:
+
+* Flag reuse of the same infrastructure.
+
+* Enrich future PowerShell hits with “known bad” context.
+
+* Track the evolution of the activity (e.g., new URLs/scri
