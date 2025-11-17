@@ -1,51 +1,65 @@
 # forfiles.exe LOLBIN Detection (L2/L3 – Production)
+Author: Ala Dabat
+
+---
 
 ## 1. Threat Overview
+`forfiles.exe` is a built-in Windows utility for enumerating files and executing a command for each match. Attackers abuse it to:
+- Launch payloads via `/c` and `/p` switches
+- Proxy execution of PowerShell, cmd, wscript, mshta, rundll32
+- Load scripts or binaries from user-writable paths, SMB shares, or temp staging
+- Perform mid-chain execution where the goal is to hide behind a signed binary
 
-forfiles.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+We’re not flagging forfiles usage itself—only abnormal patterns inconsistent with admin/IT workflows.
 
-Abuse patterns for forfiles.exe in the last few years include:
+---
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+## 2. MITRE ATT&CK
+- **T1005 – Data from Local System**
+- (Commonly overlaps with proxy execution / T1218-style behaviour)
 
-Effective detection focuses on **context and behaviour**, not on treating forfiles.exe as inherently malicious.
+---
 
-## 2. MITRE ATT&CK Techniques
-
-- T1005 Data from Local System
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact Native Rule)
 
 ```kql
+// ========================================================================
+// LOLBIN: forfiles.exe – Suspicious Usage (Low Noise)
+// Author: Ala Dabat
+// Table: DeviceProcessEvents
+// ========================================================================
 let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
+let HighRisk = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
 let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "forfiles.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
+         Cmd = tostring(ProcessCommandLine),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         lcmd = tolower(Cmd)
 | where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+   or lcmd has_any ("/c", "/p", "/m", "/d")
+   or lcmd has_any (".ps1",".vbs",".js",".hta","-enc","frombase64string")
+   or lcmd has_any ("powershell","cmd /c","wscript","cscript","mshta","rundll32")
+   or lcmd has_any ("http://","https://")
+   or lcmd has_any (":\\users\\",":\\programdata\\","\\appdata\\","\\temp\\")
+| extend Reason =
+    case(
+       lcmd has_any ("http://","https://"), "Remote/URL-based execution",
+       lcmd has_any ("-enc","frombase64string"), "Encoded command payload",
+       lcmd has_any (".ps1",".vbs",".js",".hta"), "Script proxy via forfiles",
+       lcmd has_any ("powershell","wscript","mshta","rundll32"), "Proxy execution chain",
+       ParentImage !in (AllowedParents), "Unusual parent process",
+       true, "Rare forfiles usage"
+    )
+| extend Privileged = iif(AccountName in (HighRisk), "Yes","No")
+| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
+          FileName, ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, Reason, ReportId
 | order by Timestamp desc
+
 ```
 
 ## 4. Hunter Directives & L3 Pivot Strategy
