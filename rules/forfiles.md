@@ -48,65 +48,61 @@ DeviceProcessEvents
 | order by Timestamp desc
 ```
 
-Key properties:
+## 4. Hunter Directives & L3 Pivot Strategy
 
-- Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
-- Treats rare parents and encoded / network‑touching commands as primary signal.
-- Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+### 4.1. Process Chain
 
-## 4. L3 Pivot Strategy
+Rebuild the process tree:
+`parent` → **`forfiles.exe`** → `child command`
 
-Once a hit is generated:
+**Flags to look for:**
+* **Parents:** Office applications, browsers, mail clients, script hosts.
+* **Children:** `PowerShell`, `cmd`, `rundll32`, `mshta`, `wscript`, `cscript`, `curl`, `certutil` (all are common initial execution targets).
+* `/c` invoking scripts or binaries from user directories (e.g., `%TEMP%`, `%APPDATA%`).
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → forfiles.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+### 4.2. File Activity
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+Pivot to `DeviceFileEvents` **±1h** around the hit:
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+* **Staging Indicators:** Look for new EXE/DLL/PS1/VBS/JS created or modified **before** the `forfiles` command runs, typically in `%TEMP%`, `%AppData%`, `%ProgramData%`, or `Downloads`.
+* **Behavior:** Identify if the EXE/DLL was written → executed → removed shortly after.
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+### 4.3. Network Behaviour
 
-## 5. Baselining and Suppression
+Check `DeviceNetworkEvents` around the hit:
 
-To keep this rule production‑safe:
+* **Traffic:** Outbound traffic right after `forfiles` triggers a payload.
+* **Infrastructure:** Bare IP connections, newly-observed domains, odd ports.
+* **Correlation:** Look for URLs seen directly in `/c` commands (e.g., used by `curl`, PowerShell download cradles, or `mshta`).
 
-- Capture **all legitimate** forfiles.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+### 4.4. Identity & Scope
 
-## 6. CTI / MISP / OpenCTI Integration
+* **User Role:** Note if `Privileged == Yes` for immediate escalation.
+* **Scope Check:**
+    * Look for multiple suspicious `forfiles` executions from the same user.
+    * Check for recent risky sign-ins or MFA spam associated with the user.
+    * See if the `forfiles` pattern is repeating across multiple hosts (campaign-level activity).
 
-For confirmed malicious instances:
+---
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+## 5. Baselining & Suppression
 
-This turns a single host‑level detection into durable intelligence.
+* **Baseline:** Record normal `forfiles` usage over 2–4 weeks.
+* **Typical Legitimate Use Cases:**
+    * IT/scripts cleaning temp folders.
+    * Log rotation jobs.
+    * Vendor tools using `forfiles` for maintenance.
+* **Tuning:** Allow only **specific known-good command lines**.
+* **Maintenance:** Re-baseline after significant software rollouts.
+
+### Severity Guidance:
+
+* **High:** Encoded commands, script proxies, remote URLs.
+* **Medium:** `/c` running unsigned EXEs from user paths.
+* **Low:** Benign cleanup jobs with expected parents.
+
+## 6. Operational Notes
+
+This is a clean, native rule—no Threat Intelligence (TI) feeds required.
+
+The rule's intent is to cover real-world abuse where `forfiles` is used as a **stealth launcher** or **file-iteration execution proxy**, without flagging standard cleanup or maintenance routines.
