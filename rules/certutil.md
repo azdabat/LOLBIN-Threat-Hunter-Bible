@@ -24,20 +24,23 @@ Detection must treat **`bitsadmin.exe` as suspicious by behaviour and context**,
 
 ## 2. MITRE ATT&CK Techniques
 
-Primary:
+1. Threat Overview
+certutil.exe is a legitimate Windows binary frequently abused by threat actors to execute malicious operations within a trusted process context. This technique evades basic allow-lists and simplistic EDR detection rules.
 
-- **T1197 – BITS Jobs** (download, execute, clean-up via BITS jobs)
-- **T1105 – Ingress Tool Transfer / Remote File Copy**
-- **T1071 – Application Layer Protocol** (HTTP/HTTPS command & control / staging)
-- **T1564.004 – Hide Artifacts: NTFS Alternate Data Streams**
-- **T1053.005 – Scheduled Task / Job (BITS-like job scheduling for persistence)**
+Common abuse patterns include:
+- Downloading or loading malicious payloads in phishing and web-delivered attack chains
+- Execution from uncommon or user-facing parent processes (Office applications, browsers, email clients)
+- Obfuscated command lines hiding payloads and infrastructure details
+- Usage in mid-chain attack stages (post-initial access, pre-lateral movement)
 
-Supporting (depending on usage):
+Effective detection requires behavioral analysis and contextual awareness rather than treating certutil.exe as inherently malicious.
 
-- **T1560 – Archive Collected Data** (if pulling/staging archives)
-- **T1567 – Exfiltration over Web Services** (BITS upload jobs)
-- **T1070 – Indicator Removal on Host** (using BITS to remove artefacts post-execution)
+2. MITRE ATT&CK Techniques
+T1105: Ingress Tool Transfer
+T1027: Obfuscated Files or Information
+T1059: Command and Scripting Interpreter
 
+3. Advanced Hunting Query (MDE/Sentinel)
 ---
 
 ## 3. Advanced Hunting Query (MDE – L3 Rule Core)
@@ -56,121 +59,33 @@ Use it as:
 // Goal: Catch suspicious downloader / persistence / ADS / exfil abuse
 // ======================================================================
 
-let lookback = 7d;
+// Description: Detect suspicious certutil.exe activity using known LOLBin patterns from sources like LOLBAS
+// Focuses on native Windows binaries abuse while excluding CTI-specific indicators
+CertUtil LOLBin Detection (L2/L3 - Production)
 
-// -------------------------------------------
-// Tunables – adapt to your environment
-// -------------------------------------------
 
-// Parents that commonly/legitimately spawn bitsadmin in your org
-let AllowedParents = dynamic([
-    "explorer.exe",
-    "svchost.exe",
-    "services.exe"
-]);
-
-// High-value or admin accounts (expand per org)
-let HighValueAccounts = dynamic([
-    "Administrator",
-    "Domain Admin",
-    "Enterprise Admin"
-]);
-
-// Behavioural tokens
-let DownloadTokens    = dynamic(["http://","https://","ftp://"]);
-let ScriptTokens      = dynamic([".ps1",".vbs",".js",".hta","wscript","cscript","powershell"]);
-let EncodingTokens    = dynamic([" -enc ","-EncodedCommand","FromBase64String"]);
-let PersistenceTokens = dynamic(["/SetNotifyCmdLine","/setnotifycmdline"," /create "," /addfile "," /resume "," /complete "]);
-let ADSTokens         = dynamic([":Zone.Identifier",":$DATA",":hidden"]);
-let UploadTokens      = dynamic([" /upload ","/UPLOAD "]);
-
+let lookback = 7d
+let HighRiskAccounts = dynamic(["Administrator", "SYSTEM", "NT AUTHORITY\\SYSTEM"]);
+let AllowedParents = dynamic(["explorer.exe", "svchost.exe", "msiexec.exe", "mmc.exe"]);
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName =~ "bitsadmin.exe"
-// Normalise core fields
-| extend
-    ParentImage = tostring(InitiatingProcessFileName),
-    ParentCmd   = tostring(InitiatingProcessCommandLine),
-    Cmd         = tostring(ProcessCommandLine),
-    Account     = tostring(AccountName)
-// Behaviour flags
-| extend
-    HasDownload    = Cmd has_any (DownloadTokens),
-    HasScript      = Cmd has_any (ScriptTokens),
-    HasEncoding    = Cmd has_any (EncodingTokens),
-    HasPersistence = Cmd has_any (PersistenceTokens),
-    HasADS         = Cmd has_any (ADSTokens),
-    HasUpload      = Cmd has_any (UploadTokens),
-    IsRareParent   = iif(ParentImage !in (AllowedParents), 1, 0),
-    IsPrivAccount  = iif(Account in (HighValueAccounts), 1, 0)
-// Simple risk scoring – tune thresholds in rules
-| extend RiskScore =
-    0
-    + 2 * todouble(HasDownload)
-    + 2 * todouble(HasPersistence)
-    + 2 * todouble(HasEncoding)
-    + 1 * todouble(HasScript)
-    + 1 * todouble(HasADS)
-    + 1 * todouble(HasUpload)
-    + 1 * todouble(IsRareParent)
-    + 1 * todouble(IsPrivAccount)
-// Detection tier
-| extend DetectionTier = case(
-    RiskScore >= 7, "High",
-    RiskScore >= 4, "Medium",
-    "Low"
-)
-// Analyst-facing justification
+| where FileName =~ "certutil.exe"
+| extend ParentImage = tostring(InitiatingProcessFileName),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         Cmd = tostring(ProcessCommandLine)
+| where ParentImage !in~ (AllowedParents)
+    or Cmd has_any ("http", "https", ".hta", ".js", ".jse", ".vbs", ".vbe", ".ps1", ".dll", "-encode", "-decode", "FromBase64String", "ToBase64String", "decode", "encode", "urlcache", "faultrep.dll")
 | extend SuspiciousReason = case(
-    HasDownload and HasPersistence and IsRareParent == 1,
-        "BITS job created from rare parent with URL + persistence (notify cmdline)",
-    HasDownload and HasEncoding,
-        "BITS used as encoded downloader (URL + encoding)",
-    HasDownload and HasScript,
-        "BITS downloading script or loader content",
-    HasADS,
-        "BITS referencing NTFS alternate data streams",
-    HasUpload,
-        "BITS used for possible data upload / exfiltration",
-    IsRareParent == 1,
-        "bitsadmin.exe spawned from rare or user-facing parent",
-    IsPrivAccount == 1,
-        "bitsadmin.exe executed under high-value account",
-    true,
-        "Unusual bitsadmin.exe usage – review in context"
-)
-// Inline hunter directives – can be surfaced in the alert description
-| extend HuntingDirectives = case(
-    DetectionTier == "High",
-        "Treat as likely malicious. Isolate host, capture triage package, pivot to DeviceFileEvents and DeviceNetworkEvents +/- 2h. Extract URLs, hashes, and child processes; check for persistence via BITS jobs and scheduled tasks; escalate as incident if any payload execution or ransomware staging is observed.",
-    DetectionTier == "Medium",
-        "Review full process tree (parent + children), then pivot to DeviceFileEvents and DeviceNetworkEvents. Validate URL/domain against CTI and reputation. If infrastructure is first-seen or risky, scope for other hosts and users, and consider containment.",
-    // Low tier
-        "Baseline this usage. Confirm whether this is part of known admin tooling or software update workflows. If benign, document and consider adding a scoped allow-pattern for this exact parent + command structure."
-)
-| project
-    Timestamp,
-    DeviceId,
-    DeviceName,
-    FileName,
-    Cmd,
-    ParentImage,
-    ParentCmd,
-    AccountName = Account,
-    InitiatingProcessAccountName,
-    DetectionTier,
-    RiskScore,
-    SuspiciousReason,
-    HuntingDirectives,
-    HasDownload,
-    HasPersistence,
-    HasEncoding,
-    HasScript,
-    HasADS,
-    HasUpload,
-    IsRareParent,
-    IsPrivAccount,
-    ReportId
+    Cmd contains "http" or Cmd contains "https", "Remote resource retrieval",
+    Cmd has_any (".hta", ".js", ".jse", ".vbs", ".vbe", ".ps1"), "Script file interaction",
+    Cmd has_any ("-encode", "-decode", "FromBase64String", "ToBase64String"), "Encoding/decoding activity",
+    Cmd has_any ("urlcache", "faultrep.dll"), "Alternative data stream or DLL abuse",
+    "Unusual parent process or invocation pattern"
+  )
+| extend PrivilegedAccount = iff(AccountName in~ (HighRiskAccounts), "Yes", "No")
+| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
+          FileName, ProcessCommandLine = Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
+          ReportId, SuspiciousReason
 | order by Timestamp desc
 
 ```
