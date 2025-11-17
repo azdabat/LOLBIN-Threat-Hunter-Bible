@@ -1,52 +1,51 @@
-# mshta.exe LOLBIN Detection (L2/L3 – Production)
+# mshta.exe LOLBIN Detection (L3 – Production, Native)
+Author: Ala Dabat
 
 ## 1. Threat Overview
+mshta.exe executes HTML Applications (HTA) and scriptlets. Attackers abuse it to load remote HTA, JS, VBS, and SCT payloads; execute fileless inline commands; bypass AppLocker allow-listing; trigger chained LOLBIN activity (mshta → powershell/cscript); and execute under rare parents such as Office, browsers, RMM tools, and scheduled tasks. Detection focuses on command content, URL usage, parent process, and writable-path behaviours.
 
-mshta.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+## 2. MITRE Mapping
+- T1218.005 – Signed Binary Proxy Execution (mshta)
+- T1059 – JScript/VBScript Interpreter
+- T1204 – User Execution
 
-Abuse patterns for mshta.exe in the last few years include:
-
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
-
-Effective detection focuses on **context and behaviour**, not on treating mshta.exe as inherently malicious.
-
-## 2. MITRE ATT&CK Techniques
-
-- T1059 Command and Scripting Interpreter
-- T1204 User Execution
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact, Native MDE)
 
 ```kql
-let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+// mshta.exe LOLBIN Detection (L3 – Production, Native)
+// Author: Ala Dabat
+
+let lookback=7d;
+let AllowedParents=dynamic(["explorer.exe","cmd.exe","powershell.exe","pwsh.exe","svchost.exe"]);
+let HighValueAcc=dynamic(["Administrator","Domain Admin","Enterprise Admin"]);
+let UrlTokens=dynamic(["http://","https://"]);
+let ScriptTokens=dynamic([".hta",".js",".vbs",".sct"]);
+let EncTokens=dynamic(["-enc","FromBase64String"]);
+let WriteTokens=dynamic(["\\AppData\\","\\Temp\\","\\ProgramData\\","\\Users\\"]);
+
 DeviceProcessEvents
-| where Timestamp >= ago(lookback)
+| where Timestamp>=ago(lookback)
 | where FileName =~ "mshta.exe"
-| extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
-| where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+| extend ParentImage=tostring(InitiatingProcessFileName),ParentCmd=tostring(InitiatingProcessCommandLine),Cmd=tostring(ProcessCommandLine),Acc=tostring(AccountName)
+| extend HasUrl=Cmd has_any(UrlTokens),HasScript=Cmd has_any(ScriptTokens),HasEnc=Cmd has_any(EncTokens),HasWrite=Cmd has_any(WriteTokens),RareParent=iif(ParentImage !in (AllowedParents),1,0),Priv=iif(Acc in (HighValueAcc),1,0)
+| extend RiskScore=0+3*todouble(HasUrl)+3*todouble(HasScript)+2*todouble(HasEnc)+1*todouble(HasWrite)+1*todouble(RareParent)+1*todouble(Priv)
+| extend DetectionTier=case(RiskScore>=7,"High",RiskScore>=4,"Medium","Low")
+| extend SuspiciousReason=case(
+    HasUrl and HasScript,"Remote HTA/script loading",
+    HasEnc,"Encoded or obfuscated execution",
+    HasScript and RareParent==1,"Script payload from rare parent",
+    RareParent==1,"mshta launched from rare parent",
+    Priv==1,"Privileged account executing mshta",
+    "Unusual mshta behaviour"
+)
+| extend HuntingDirectives=case(
+    DetectionTier=="High","Isolate host, reconstruct process chain, inspect HTA/JS/VBS/SCT, pivot FileEvents+NetworkEvents, find chained LOLBINs, scope lateral hosts.",
+    DetectionTier=="Medium","Validate parent, domain, user role; check internal vs external; compare patterns; escalate if repeating.",
+    "Baseline candidate; confirm with owners if recurring."
+)
+| project Timestamp,DeviceId,DeviceName,FileName,Cmd,ParentImage,ParentCmd,AccountName=Acc,InitiatingProcessAccountName,DetectionTier,RiskScore,SuspiciousReason,HuntingDirectives,HasUrl,HasScript,HasEnc,HasWrite,RareParent,Priv,ReportId
 | order by Timestamp desc
+
 ```
 
 Key properties:
