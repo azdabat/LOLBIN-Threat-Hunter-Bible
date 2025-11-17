@@ -1,113 +1,127 @@
 # wevtutil.exe LOLBIN Detection (L2/L3 – Production)
+Author: Ala Dabat
+
+---
 
 ## 1. Threat Overview
+`wevtutil.exe` manages Windows Event Logs (query/clear/export). Attackers abuse it mainly to **erase logs**, reduce visibility, and hide lateral movement. It can appear in ransomware, post-exploitation cleanup, and living-off-the-land anti-forensics.
 
-wevtutil.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+Common malicious patterns:
+- `wevtutil cl <log>` to wipe PowerShell, Security, Sysmon or Operational logs  
+- Execution by Office apps, browsers, script hosts, or odd service parents  
+- Encoded command wrappers  
+- Mid-chain usage right before credential theft, privilege escalation, or staging activity
 
-Abuse patterns for wevtutil.exe in the last few years include:
+Detection focuses on context, destructive intent, and unusual parents—not legitimate admin log maintenance.
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+---
 
-Effective detection focuses on **context and behaviour**, not on treating wevtutil.exe as inherently malicious.
+## 2. MITRE ATT&CK
+- **T1070 – Indicator Removal on Host**
+- **T1565.001 – Stored Data Manipulation**
 
-## 2. MITRE ATT&CK Techniques
+---
 
-- T1070 Indicator Removal on Host
-- T1565.001 Stored Data Manipulation
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact Native Rule)
 
 ```kql
+// ========================================================================
+// LOLBIN: wevtutil.exe – Suspicious Usage (Low Noise)
+// Author: Ala Dabat
+// Table: DeviceProcessEvents
+// ========================================================================
 let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+let HighRisk = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
+let AllowedParents = dynamic(["explorer.exe","services.exe","svchost.exe"]);
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "wevtutil.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
+         Cmd = tostring(ProcessCommandLine),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         lcmd = tolower(Cmd)
+// Suspicious conditions: destructive log ops, script/encoded wrappers, odd parents
 | where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+   or lcmd has " cl "                              // log clearing
+   or lcmd has_any ("cl ","clear-log","epl ")      // clear/export patterns
+   or lcmd has_any (".ps1",".js",".vbs",".hta","-enc","frombase64string")
+   or lcmd has_any ("http://","https://")          // extremely rare but shouldn't happen
+| extend Reason =
+    case(
+        lcmd has_any ("cl ","clear-log"),          "Log clearing operation",
+        lcmd has "epl ",                           "Log export outside normal parents",
+        lcmd has_any (".ps1",".js",".vbs",".hta"), "Script-based wevtutil execution",
+        lcmd has_any ("-enc","frombase64string"),  "Encoded command wrapper",
+        ParentImage !in (AllowedParents),          "Unusual parent process",
+        true,                                      "Rare wevtutil usage"
+    )
+| extend Privileged = iif(AccountName in (HighRisk),"Yes","No")
+| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
+          FileName, ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, Reason, ReportId
 | order by Timestamp desc
+
 ```
 
-Key properties:
+## 4. Hunter Directives & L3 Pivot Strategy
 
-- Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
-- Treats rare parents and encoded / network‑touching commands as primary signal.
-- Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+### 4.1. Process Chain
 
-## 4. L3 Pivot Strategy
+Rebuild context around the hit:
+`parent` → **`wevtutil.exe`** → (child processes, if any)
 
-Once a hit is generated:
+**Red flags:**
+* **Parent:** Office application, browser, `mshta`/`wscript`, or suspicious services.
+* **Timing:** `wevtutil` invoked right after suspicious PowerShell or credential access activity.
+* **Frequency:** `wevtutil` used multiple times in a short window (log tampering attempt).
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → wevtutil.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+### 4.2. File/Log Activity
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+Pivot into `DeviceEvents` and `DeviceFileEvents` **±1h**:
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+**Look for:**
+* Prior PowerShell/AMSI bypass attempts.
+* Access to Security/Sysmon/PowerShell logs followed by clearing (`cl`).
+* Temporary files created during `.evtx` (export) manipulation.
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+### 4.3. Network Behaviour
 
-## 5. Baselining and Suppression
+Check `DeviceNetworkEvents` around the execution:
 
-To keep this rule production‑safe:
+* **Staging/Exfil:** Network changes after log clearing can indicate staging or data exfiltration.
+* **Infrastructure:** First-seen domains or direct IPs right after cleanup.
+* **Anomaly:** It is **rare** for legitimate log maintenance to coincide with outbound network traffic.
 
-- Capture **all legitimate** wevtutil.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+### 4.4. Identity & Scope
 
-## 6. CTI / MISP / OpenCTI Integration
+* **Prioritize:** Escalate immediately if **`Privileged == Yes`**.
+* **Review:**
+    * Multiple hosts with `wevtutil cl` (clearing) around the same time.
+    * Same user clearing logs across different endpoints.
+    * M365/Azure sign-in anomalies aligning with the timestamp.
 
-For confirmed malicious instances:
+---
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+## 5. Baselining & Suppression
 
-This turns a single host‑level detection into durable intelligence.
+Record legitimate `wevtutil` usage for 2–4 weeks.
+
+**Common Benign Cases:**
+* Backup agents exporting logs (`epl`).
+* Monitoring tools performing routine queries.
+* Known maintenance scripts.
+
+**Warning:** Never globally allow `wevtutil cl` (clearing) patterns without strong justification.
+
+### Production Guidance:
+
+* **High severity:** Any log clearing (`cl`) from non-backup parents.
+* **Medium:** Encoded/scripted wrappers around `wevtutil`.
+* **Low:** Basic log queries with valid parents.
+
+## 6. Operational Notes
+
+This rule is fully standalone—no external Threat Intelligence (TI) required.
+
+It focuses on **destructive operations**, **forensic tampering**, and mid-chain abuse consistent with ransomware, stealthy lateral movement, and post-exploitation cleanup.
