@@ -37,71 +37,43 @@ Effective detection focuses on **where the DLL/EXE is loaded from** and **which 
 // Purpose: Catch high-signal rundll32 LOLBAS tradecraft with low noise
 // MITRE: T1218.011, T1105, T1564.004, T1059.*, T1574.002
 // ======================================================================
-let lookback = 7d;
-// Tune for your environment
-let HighRiskAccounts = dynamic([
-    "Administrator",
-    "SYSTEM",
-    "Domain Admins",
-    "Enterprise Admins"
-]);
-let AllowedParents = dynamic([
-    "explorer.exe",     // typical interactive
-    "svchost.exe",
-    "services.exe",
-    "dllhost.exe"
-]);
-// Main logic
+let Lookback = 7d;
+let HighRiskAccounts = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
+
 DeviceProcessEvents
-| where Timestamp >= ago(lookback)
+| where Timestamp >= ago(Lookback)
 | where FileName =~ "rundll32.exe"
-| extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
-| extend LowerCmd = tolower(Cmd)
-// ---- Suspicious conditions (any) --------------------------------------
-// 1) Suspicious helper DLLs / exports used in LOLBAS patterns
-| where ParentImage !in (AllowedParents)
-   or LowerCmd has_any (
-        "mshtml,runhtmlapplication",       // HTML application / scriptlet
-        " url.dll,openurl",                // url.dll OpenURL
-        " url.dll,fileprotocolhandler",    // url.dll FileProtocolHandler
-        "photoviewer.dll,imageview_fullscreen",
-        "shimgvw.dll,imageview_fullscreen",
-        "shell32.dll,control_rundll",
-        "shell32.dll,shellexec_rundll",
-        "setupapi.dll,installhinfsection",
-        "zipfldr.dll,routethecall",
-        "desk.cpl,installscreensaver"
+| extend ProcessCommandLineText = tostring(ProcessCommandLine),
+         ParentExecutableName = tostring(InitiatingProcessFileName),
+         ParentProcessCommandLineText = tostring(InitiatingProcessCommandLine),
+         LowercaseProcessCommandLine = tolower(ProcessCommandLineText)
+| where ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe","dllhost.exe")
+   or LowercaseProcessCommandLine has_any (
+        "mshtml,runhtmlapplication"," url.dll,openurl"," url.dll,fileprotocolhandler",
+        "photoviewer.dll","shimgvw.dll","shell32.dll,control_rundll",
+        "shell32.dll,shellexec_rundll","setupapi.dll,installhinfsection",
+        "zipfldr.dll,routethecall","desk.cpl,installscreensaver"
      )
-// 2) Script/HTA/INF/ScreenSaver loaders
-   or LowerCmd has_any (".sct",".js",".vbs",".wsh",".hta",".scr",".inf")
-// 3) DLL in NTFS alternate data stream (file.txt:stream.dll)
-   or LowerCmd matches regex @"[:][^\\s]+\.dll(\W|$)"
-// 4) Execution from user-writable or remote SMB/UNC path
-   or LowerCmd has_any (@":\\users\\",":\\programdata\\",":\\windows\\temp\\","\\\\")
-// 5) Rundll32 used as a downloader or with remote URL
-   or Cmd has_any ("http://","https://")
-// 6) Rundll32 launched without the usual comma/entrypoint
-   or Cmd !has ","
-// ---- Enrichment -------------------------------------------------------
-| extend SuspiciousCategory =
+   or LowercaseProcessCommandLine has_any (".js",".vbs",".sct",".ps1",".hta",".inf",".scr")
+   or LowercaseProcessCommandLine matches regex @"[:][^\\s]+\.dll(\W|$)"
+   or LowercaseProcessCommandLine has_any ("\\\\","http://","https://",":\\users\\","\\temp\\","\\appdata\\",":\\programdata\\")
+| extend DetectionReason =
     case(
-        LowerCmd has "mshtml,runhtmlapplication",           "Scriptlet / HTML application via mshtml",
-        LowerCmd has_any (" url.dll,openurl"," url.dll,fileprotocolhandler"), "url.dll OpenURL / FileProtocolHandler payload",
-        LowerCmd has_any ("photoviewer.dll,imageview_fullscreen","shimgvw.dll,imageview_fullscreen"), "Photo viewer DLL download to cache",
-        LowerCmd matches regex @"[:][^\\s]+\.dll(\W|$)",   "DLL from NTFS alternate data stream",
-        LowerCmd has_any ("desk.cpl,installscreensaver",".scr"), "Screen saver (.scr) execution proxy",
-        LowerCmd has_any ("setupapi.dll,installhinfsection",".inf"), "Setupapi INF execution / AWL bypass",
-        LowerCmd has "zipfldr.dll,routethecall",            "Zipfldr RouteTheCall proxy EXE execution",
-        LowerCmd has_any ("shell32.dll,control_rundll","shell32.dll,shellexec_rundll"), "Shell32 proxy EXE/DLL execution",
-        Cmd has_any ("http://","https://"),                 "Remote URL / download via rundll32",
-        LowerCmd has "\\\\",                                "DLL/EXE from UNC/SMB share",
-        ParentImage !in (AllowedParents),                   "Anomalous parent for rundll32.exe",
-        true,                                               "Rare rundll32 usage pattern"
+        LowercaseProcessCommandLine has "mshtml,runhtmlapplication","Scriptlet execution",
+        LowercaseProcessCommandLine has_any (" url.dll,openurl"," url.dll,fileprotocolhandler"),"url.dll execution",
+        LowercaseProcessCommandLine has_any ("photoviewer.dll","shimgvw.dll"),"Photo viewer proxy",
+        LowercaseProcessCommandLine matches regex @"[:][^\\s]+\.dll(\W|$)","ADS DLL execution",
+        LowercaseProcessCommandLine has "setupapi.dll,installhinfsection","INF execution",
+        LowercaseProcessCommandLine has "zipfldr.dll,routethecall","Zipfldr proxy",
+        LowercaseProcessCommandLine has_any ("shell32.dll,control_rundll","shell32.dll,shellexec_rundll"),"Shell32 proxy",
+        LowercaseProcessCommandLine has_any ("http://","https://"),"Remote URL execution",
+        ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe","dllhost.exe"),"Unexpected parent",
+        true,"Rare rundll32 invocation"
     )
-| extend IsHighRiskUser = iif(AccountName in (HighRiskAccounts), true, false)
-| project Timestamp, DeviceId, DeviceName, AccountName, InitiatingProcessAccountName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, ParentImage, SuspiciousCategory, IsHighRiskUser, ReportId
+| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts),"Yes","No")
+| project Timestamp,DeviceId,DeviceName,AccountName,PrivilegedAccount,
+          FileName,ProcessCommandLineText,ParentExecutableName,
+          ParentProcessCommandLineText,DetectionReason,ReportId
 | order by Timestamp desc
 
 ```
