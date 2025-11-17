@@ -2,51 +2,66 @@
 
 ## 1. Threat Overview
 
-powershell.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+`powershell.exe` is a legitimate Windows binary and one of the most abused LOLBINs on modern Windows systems. Adversaries use it for:
 
-Abuse patterns for powershell.exe in the last few years include:
+- **Download & execute**: pulling payloads from HTTP/HTTPS and executing directly in memory.
+- **Living-off-the-land**: interacting with the registry, WMI, services, scheduled tasks, and the file system using native cmdlets.
+- **Fileless malware**: heavy use of `-EncodedCommand`, `Invoke-Expression`, and in-memory loaders to avoid dropping binaries.
+- **Payload staging & lateral movement**: running offensive frameworks (PowerView, PowerSploit, Empire, Covenant, Cobalt Strike loaders).
+- **Defense evasion**: disabling logging, tampering with AMSI, or using reflection and obfuscation frameworks.
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+Effective detection focuses on **command-line behaviour + parent process + account context**, not on treating `powershell.exe` as inherently malicious.
 
-Effective detection focuses on **context and behaviour**, not on treating powershell.exe as inherently malicious.
+---
 
 ## 2. MITRE ATT&CK Techniques
 
-- T1059 Command and Scripting Interpreter
-- T1204 User Execution
+- **T1059.001 – Command and Scripting Interpreter: PowerShell**  
+- **T1204 – User Execution** (macros / lures spawning PowerShell)  
+- **T1105 – Ingress Tool Transfer** (download of payloads/scripts)  
+- **T1562 – Impair Defenses** (disabling logging / AMSI)  
+
+---
 
 ## 3. Advanced Hunting Query (MDE)
 
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+The following query is written for Microsoft Defender for Endpoint Advanced Hunting and is designed for interactive hunts or as the basis for a scheduled detection. It focuses on **rare parents, network usage, encoded commands, and script-loader behaviour** while still being production-safe.
 
 ```kql
 let lookback = 7d;
 let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe","winlogon.exe"]);
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName =~ "powershell.exe"
+| where FileName =~ "powershell.exe" or FileName =~ "pwsh.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
          ParentCmd   = tostring(InitiatingProcessCommandLine),
          Cmd         = tostring(ProcessCommandLine)
-| where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
+| extend HasRemote = Cmd has_any ("http:","https:"),
+         HasScriptLoader = Cmd has_any (".ps1",".psm1",".js",".vbs",".hta","Invoke-Expression","IEX","DownloadString"),
+         HasEncoded = Cmd has_any ("-enc","-encodedcommand","FromBase64String"),
+         HasAmsiOrLogTamper = Cmd has_any ("amsiUtils","AmsiScanBuffer","Bypass","Set-StrictMode","LogName \"Microsoft-Windows-PowerShell\"","Disable-ModuleLogging"),
+         RareParent = iif(ParentImage !in (AllowedParents), 1, 0),
+         PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
+| where RareParent == 1
+    or HasRemote
+    or HasEncoded
+    or HasScriptLoader
+    or HasAmsiOrLogTamper
 | extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
+    HasRemote and HasScriptLoader, "Remote script download and execution behaviour",
+    HasRemote, "PowerShell making HTTP/S calls (possible C2/download)",
+    HasEncoded, "Encoded or heavily obfuscated PowerShell command line",
+    HasAmsiOrLogTamper, "Possible AMSI/logging tampering or defense evasion",
+    HasScriptLoader, "Script-loader behaviour (IEX/DownloadString/.ps1/.js/.vbs)",
+    RareParent == 1, "PowerShell spawned from a rare parent process",
+    true, "Unusual PowerShell invocation"
   )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
 | project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
           FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
           ReportId, SuspiciousReason
 | order by Timestamp desc
+
 ```
 
 Key properties:
