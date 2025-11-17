@@ -28,36 +28,35 @@ We’re not flagging forfiles usage itself—only abnormal patterns inconsistent
 // Author: Ala Dabat
 // Table: DeviceProcessEvents
 // ========================================================================
-let lookback = 7d;
-let HighRisk = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+let Lookback = 7d;
+let HighRiskAccounts = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
 
 DeviceProcessEvents
-| where Timestamp >= ago(lookback)
+| where Timestamp >= ago(Lookback)
 | where FileName =~ "forfiles.exe"
-| extend ParentImage = tostring(InitiatingProcessFileName),
-         Cmd = tostring(ProcessCommandLine),
-         ParentCmd = tostring(InitiatingProcessCommandLine),
-         lcmd = tolower(Cmd)
-| where ParentImage !in (AllowedParents)
-   or lcmd has_any ("/c", "/p", "/m", "/d")
-   or lcmd has_any (".ps1",".vbs",".js",".hta","-enc","frombase64string")
-   or lcmd has_any ("powershell","cmd /c","wscript","cscript","mshta","rundll32")
-   or lcmd has_any ("http://","https://")
-   or lcmd has_any (":\\users\\",":\\programdata\\","\\appdata\\","\\temp\\")
-| extend Reason =
+| extend ProcessCommandLineText = tostring(ProcessCommandLine),
+         ParentExecutableName = tostring(InitiatingProcessFileName),
+         ParentProcessCommandLineText = tostring(InitiatingProcessCommandLine),
+         LowercaseProcessCommandLine = tolower(ProcessCommandLineText)
+| where ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe")
+   or LowercaseProcessCommandLine has_any ("/c","/p","/m","/d")
+   or LowercaseProcessCommandLine has_any (".ps1",".js",".vbs",".hta","-enc","frombase64string")
+   or LowercaseProcessCommandLine has_any ("powershell","cmd /c","wscript","cscript","mshta","rundll32")
+   or LowercaseProcessCommandLine has_any ("http://","https://",":\\users\\","\\appdata\\","\\temp\\",":\\programdata\\")
+| extend DetectionReason =
     case(
-       lcmd has_any ("http://","https://"), "Remote/URL-based execution",
-       lcmd has_any ("-enc","frombase64string"), "Encoded command payload",
-       lcmd has_any (".ps1",".vbs",".js",".hta"), "Script proxy via forfiles",
-       lcmd has_any ("powershell","wscript","mshta","rundll32"), "Proxy execution chain",
-       ParentImage !in (AllowedParents), "Unusual parent process",
-       true, "Rare forfiles usage"
+        LowercaseProcessCommandLine has_any (".ps1",".js",".vbs",".hta"),"Script payload",
+        LowercaseProcessCommandLine has_any ("http://","https://"),"URL loader",
+        LowercaseProcessCommandLine has_any ("-enc","frombase64string"),"Encoded payload",
+        LowercaseProcessCommandLine has_any ("powershell","mshta","wscript","rundll32"),"Proxy chain",
+        LowercaseProcessCommandLine has_any (":\\users\\","\\temp\\"),"User-writable payload",
+        ParentExecutableName !in ("explorer.exe","svchost.exe","services.exe"),"Unexpected parent",
+        true,"Rare forfiles usage"
     )
-| extend Privileged = iif(AccountName in (HighRisk), "Yes","No")
-| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
-          FileName, ProcessCommandLine, InitiatingProcessFileName,
-          InitiatingProcessCommandLine, Reason, ReportId
+| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts),"Yes","No")
+| project Timestamp,DeviceId,DeviceName,AccountName,PrivilegedAccount,
+          FileName,ProcessCommandLineText,ParentExecutableName,
+          ParentProcessCommandLineText,DetectionReason,ReportId
 | order by Timestamp desc
 
 ```
