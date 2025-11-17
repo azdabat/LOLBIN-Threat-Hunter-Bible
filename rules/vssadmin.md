@@ -1,113 +1,126 @@
 # vssadmin.exe LOLBIN Detection (L2/L3 – Production)
+Author: Ala Dabat
+
+---
 
 ## 1. Threat Overview
+`vssadmin.exe` manages Windows Volume Shadow Copies. Attackers use it primarily for **anti-forensic cleanup** and **ransomware preparation**, deleting backups and shadow copies so recovery is impossible.
 
-vssadmin.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
-execution into a signed, trusted process. This evades naïve allow‑lists and simplistic EDR rules.
+Real abuse patterns:
+- `vssadmin delete shadows /all /quiet` used early in ransomware chains
+- vssadmin invoked by Office apps, browsers, script hosts, or odd service parents
+- Encoded loader sequences wrapping vssadmin calls
+- Mid-chain execution after initial access but before impact
 
-Abuse patterns for vssadmin.exe in the last few years include:
+The goal is to detect destructive or abnormal context—not legitimate backup maintenance.
 
-- Use as a downloader or loader as part of phishing and web‑delivered chains.
-- Execution with rare or clearly user‑facing parent processes (Office, browser, mail clients).
-- Obfuscated or encoded command lines designed to hide payloads and infrastructure.
-- Use in mid‑chain stages (post‑initial access, pre‑lateral movement) rather than at the edges.
+---
 
-Effective detection focuses on **context and behaviour**, not on treating vssadmin.exe as inherently malicious.
+## 2. MITRE ATT&CK
+- **T1070 – Indicator Removal on Host**
+- **T1565.001 – Stored Data Manipulation**
 
-## 2. MITRE ATT&CK Techniques
+---
 
-- T1070 Indicator Removal on Host
-- T1565.001 Stored Data Manipulation
-
-## 3. Advanced Hunting Query (MDE)
-
-The following query is written for Microsoft Defender for Endpoint Advanced Hunting
-and is designed to be used either interactively or as the basis for a scheduled rule.
+## 3. Advanced Hunting Query (Compact Native Rule)
 
 ```kql
+// ========================================================================
+// LOLBIN: vssadmin.exe – Suspicious Usage (Low Noise)
+// Author: Ala Dabat
+// Table: DeviceProcessEvents
+// ========================================================================
 let lookback = 7d;
-let HighRiskAccounts = dynamic(["Administrator","Domain Admins","Enterprise Admins"]);
-let AllowedParents = dynamic(["explorer.exe","svchost.exe","services.exe"]);
+let HighRisk = dynamic(["Administrator","SYSTEM","Domain Admins","Enterprise Admins"]);
+let AllowedParents = dynamic(["explorer.exe","services.exe","svchost.exe"]);
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "vssadmin.exe"
 | extend ParentImage = tostring(InitiatingProcessFileName),
-         ParentCmd   = tostring(InitiatingProcessCommandLine),
-         Cmd         = tostring(ProcessCommandLine)
+         Cmd = tostring(ProcessCommandLine),
+         ParentCmd = tostring(InitiatingProcessCommandLine),
+         lcmd = tolower(Cmd)
+// Suspicious patterns: destructive shadow copy ops, scripts, encoded payloads, unusual parents
 | where ParentImage !in (AllowedParents)
-    or Cmd has_any ("http:", "https:", ".hta", ".js", ".vbs", ".ps1", ".dll", "-enc", "FromBase64String")
-| extend SuspiciousReason = case(
-    Cmd has_any ("http:", "https:"), "Remote URL / download usage",
-    Cmd has_any (".hta",".js",".vbs",".ps1"), "Script content or loader behaviour",
-    Cmd has_any ("-enc","FromBase64String"), "Encoded or in‑memory payload",
-    true, "Anomalous parent or rare invocation"
-  )
-| extend PrivilegedAccount = iif(AccountName in (HighRiskAccounts), "Yes", "No")
-| project Timestamp, DeviceId, DeviceName, AccountName, PrivilegedAccount,
-          FileName, Cmd, ParentImage, ParentCmd, InitiatingProcessAccountName,
-          ReportId, SuspiciousReason
+   or lcmd has "delete shadows"
+   or lcmd has_any ("/all","/quiet","/for=")
+   or lcmd has_any (".ps1",".js",".vbs",".hta","-enc","frombase64string")
+   or lcmd has_any ("http://","https://")
+| extend Reason =
+    case(
+        lcmd has "delete shadows", "Shadow copy deletion",
+        lcmd has_any ("/all","/quiet","/for="), "Destructive VSS operation",
+        lcmd has_any ("-enc","frombase64string"), "Encoded command wrapper",
+        lcmd has_any (".ps1",".js",".vbs",".hta"), "Script-based vssadmin execution",
+        ParentImage !in (AllowedParents), "Anomalous parent process",
+        true, "Rare vssadmin usage"
+    )
+| extend Privileged = iif(AccountName in (HighRisk),"Yes","No")
+| project Timestamp, DeviceId, DeviceName, AccountName, Privileged,
+          FileName, ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, Reason, ReportId
 | order by Timestamp desc
+
 ```
 
-Key properties:
+## 4. Hunter Directives & L3 Pivot Strategy
 
-- Leverages `InitiatingProcessFileName` and `ProcessCommandLine` for context.
-- Treats rare parents and encoded / network‑touching commands as primary signal.
-- Provides a `SuspiciousReason` column to explain why the row is interesting.
-- Surfaces privileged accounts separately for accelerated triage.
+### 4.1. Process Chain
 
-## 4. L3 Pivot Strategy
+Rebuild context around the hit:
+`parent` → **`vssadmin.exe`** → `child`
 
-Once a hit is generated:
+**Red flags:**
+* **Parent:** Office applications, web browsers, `wscript.exe`, `mshta.exe`, or suspicious services.
+* **Child Processes:** Look for follow-on child processes (rare but relevant in staged loaders).
+* **Timing:** Shadow deletion shortly after suspicious file drops or mass file activity.
 
-1. **Expand process context**
-   - Query `DeviceProcessEvents` for the same `DeviceId` and `ReportId`.
-   - Build an execution graph: parent → vssadmin.exe → children.
-   - Identify whether any downstream processes are clearly malicious (dumpers, tunnellers, archivers, RDP tools).
+### 4.2. File Activity
 
-2. **File system activity**
-   - Pivot into `DeviceFileEvents` for the same host ±1 hour.
-   - Look for:
-     - Newly‑written EXE/DLL/PS1/VBS/JS in user profile, temp, ProgramData.
-     - Files executed shortly after being written.
+Pivot to `DeviceFileEvents` **±1h**:
 
-3. **Network behaviour**
-   - Pivot into `DeviceNetworkEvents` using the same time window.
-   - Extract remote IPs, domains, ports and correlate with CTI.
-   - Pay particular attention to first‑seen infrastructure and unusual TLDs.
+**Look for ransomware precursors:**
+* File encryption patterns.
+* Mass file renames or write bursts.
+* Dropped EXEs/PS1/JS/VBS in `TEMP`/`AppData` **before** `vssadmin` runs.
+* **Confirm signing:** Installer/updater behaviour normally has predictable parents—confirm the signer and known path of any preceding files.
 
-4. **Identity and scope**
-   - Identify the user and business role.
-   - Check whether this account has other anomalies (Azure sign‑ins, MFA fatigue, risky sign‑ins).
+### 4.3. Network Indicators
 
-## 5. Baselining and Suppression
+Check `DeviceNetworkEvents` around the execution:
 
-To keep this rule production‑safe:
+* **Traffic:** C2 callbacks before or after shadow deletion.
+* **Infrastructure:** Bare IPs, TOR exit nodes, previously unseen domains.
+* **Context:** Activity from a user workstation or jump host is generally **more suspicious** than benign server-side operations.
 
-- Capture **all legitimate** vssadmin.exe usage for at least 14–30 days.
-- Document:
-  - Parents,
-  - Command lines,
-  - Typical times and hosts.
-- Create **tight** allow‑patterns, never wildcards across full command lines.
-- Re‑validate baselines after:
-  - Major software rollouts,
-  - Tooling changes,
-  - Admin process changes.
+### 4.4. Identity & Scope
 
-## 6. CTI / MISP / OpenCTI Integration
+* **Escalation:** If `Privileged == Yes`, escalate immediately.
+* **Scope Check:**
+    * Check if the same account invoked `vssadmin` across multiple hosts.
+    * See if the user has compromised credentials (risky sign-ins, token anomalies).
+    * Look for other LOLBINs fired before/after (e.g., `wmic`, `wbadmin`, `bcdedit`).
 
-For confirmed malicious instances:
+---
 
-- Extract:
-  - File hashes of payloads and staging artefacts.
-  - Domains, IPs, URIs observed in network connections.
-- Push to MISP/OpenCTI as:
-  - Attributes on existing intrusion sets where appropriate.
-  - New events where this represents a new cluster or campaign.
-- Tag events with:
-  - Confidence level,
-  - Kill‑chain phase,
-  - Detection source (LOLBIN MDE rule, Sentinel analytic).
+## 5. Baselining & Suppression
 
-This turns a single host‑level detection into durable intelligence.
+* **Observe:** Record normal `vssadmin` usage for 2–4 weeks.
+* **Allow:**
+    * Backup agent parents.
+    * Vendor-signed maintenance utilities.
+    * Known-good `/list shadows` operations.
+* **Warning:** Never allow `/all /quiet` patterns without explicit justification.
+
+### Production Guidance:
+
+* **High severity:** Any shadow deletion from a non-backup parent.
+* **Medium:** Encoded/scripted `vssadmin` calls.
+* **Low:** Benign listing operations.
+
+## 6. Operational Notes
+
+This is a standalone MDE/Sentinel rule—no threat intel dependencies required.
+
+It focuses on **destructive operations**, odd parent chains, and real-world ransomware behaviors while keeping noise extremely low once baselined.
