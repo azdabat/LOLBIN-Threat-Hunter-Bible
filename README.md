@@ -5,6 +5,9 @@ Status: Active Development
 
 ---
 
+> [!NOTE]
+> **Placeholders currently exist and rules are constantly being tuned for production ready servers. This project is in it's early days, and completion will be finished shortly. Most sections completed including Rules **
+
 ## Overview
 
 This section contains a growing collection of production-grade detection rules focused on identifying abuse of Windows Living-off-the-Land Binaries (LOLBins). These rules are built for Microsoft Defender for Endpoint and Sentinel, using behaviour-first logic, attacker tradecraft patterns, parent/child process lineage, and contextual scoring.
