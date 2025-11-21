@@ -1,10 +1,10 @@
-# ⛓️ Attack Chain Context: `bitsadmin.exe` (C2, Download, & Exfiltration)
+#  Attack Chain Context: `bitsadmin.exe` (C2, Download, & Exfiltration)
 
 This document provides a detailed analysis of `bitsadmin.exe` abuse within advanced threat actor attack chains. It is designed to serve as a pivot guide for L3 SOC and Threat Intelligence analysts to rapidly determine the tactical role (`C2`, `Exfiltration`, or `Execution`) of `bitsadmin.exe` in a confirmed intrusion.
 
 ---
 
-## 1. ⚔️ Real-World Attack Chain Scenarios
+## 1.  Real-World Attack Chain Scenarios
 
 While `bitsadmin.exe` can appear anywhere, three specific, high-fidelity chains are commonly observed in the wild.
 
@@ -46,7 +46,7 @@ Using BITS to upload collected data files over non-standard ports or protocols.
 
 ---
 
-## 2. 📊 Table Pivots by Phase (L3 Enhancement)
+## 2.  Table Pivots by Phase (L3 Enhancement)
 
 The pivot guide is crucial for L3 analysts to hunt for activity *before* and *after* the `bitsadmin` alert.
 
@@ -60,7 +60,7 @@ The pivot guide is crucial for L3 analysts to hunt for activity *before* and *af
 
 ---
 
-## 3. 🧠 L3 Reasoning and Intelligence Action
+## 3.  L3 Reasoning and Intelligence Action
 
 The ultimate goal is to translate raw security data into actionable threat intelligence and preventative measures.
 
