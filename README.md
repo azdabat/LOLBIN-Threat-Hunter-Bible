@@ -57,8 +57,4 @@ If you encounter gaps or want to request a specific LOLBin detection, open an is
 
 ---
 
-## Structure
-
-Recommended repository layout:
-
 
