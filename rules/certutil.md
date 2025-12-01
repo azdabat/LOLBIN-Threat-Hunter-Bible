@@ -1,4 +1,4 @@
-# bitsadmin.exe LOLBIN Detection (L3 – Production)
+# bitsadmin.exe LOLBIN Detection
 
 ## 1. Threat Overview
 
