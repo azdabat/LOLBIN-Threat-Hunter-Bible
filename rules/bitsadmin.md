@@ -1,5 +1,4 @@
-# bitsadmin.exe LOLBIN Detection (L2/L3 – Production)
-
+# bitsadmin.exe LOLBIN Detection 
 ## 1. Threat Overview
 
 bitsadmin.exe is a legitimate Windows binary. In modern intrusion tradecraft it is abused to move
