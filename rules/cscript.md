@@ -1,4 +1,4 @@
-# cscript.exe LOLBIN Detection (L2/L3 – Production)
+# cscript.exe LOLBIN Detection
 
 ## 1. Threat Overview
 
