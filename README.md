@@ -6,7 +6,7 @@ Status: Active Development
 ---
 
 > [!NOTE]
-> **Placeholders currently exist and rules are constantly being tuned for production ready servers. This project is in it's early days, and completion will be finished shortly. Most sections completed including Rules **
+> **Placeholders currently exist and rules are constantly being tuned for production ready servers. This project is in it's early days, and completion will be finished shortly. Most sections completed including Rules. See: CORE HUNTS FOR WORKING LOLBINS UNTIL THIS SECTION IS COMPLETE **
 
 ## Overview
 
